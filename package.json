@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "icons": "node scripts/make-icons.mjs",
-    "test": "tsx --test test/*.test.ts",
+    "test": "node --expose-gc --import tsx --test test/*.test.ts",
     "test:e2e": "node test/e2e.mjs"
   },
   "dependencies": {

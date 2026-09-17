@@ -84,3 +84,8 @@ written to the database. **Sources → Settings → Remove** revokes them.
 - **Testing-mode consent expires.** You will be asked to re-authorize
   periodically. Publishing the app to "In production" stops that, at the cost
   of a Google verification review.
+- **You cannot sign in from an installed iPhone app.** An iOS Home Screen app
+  can't host the consent popup, and the redirect alternative needs a client
+  secret that a serverless app has nowhere to keep. Connect these two sources
+  from a desktop browser and move the result over with **Sources → Backup** —
+  see [IPHONE.md](IPHONE.md).

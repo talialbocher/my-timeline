@@ -4,7 +4,14 @@ import { streamArrayItems } from '../src/lib/json-stream.ts'
 
 /** Feed a string through a ReadableStream in fixed-size chunks. */
 function chunked(text: string, chunkSize: number): ReadableStream<Uint8Array> {
-  const bytes = new TextEncoder().encode(text)
+  return chunkedBytes(new TextEncoder().encode(text), chunkSize)
+}
+
+/**
+ * Stream pre-encoded bytes as views rather than copies, so a memory
+ * measurement sees the parser's allocation and not the harness's.
+ */
+function chunkedBytes(bytes: Uint8Array, chunkSize: number): ReadableStream<Uint8Array> {
   let offset = 0
   return new ReadableStream({
     pull(controller) {
@@ -12,10 +19,20 @@ function chunked(text: string, chunkSize: number): ReadableStream<Uint8Array> {
         controller.close()
         return
       }
-      controller.enqueue(bytes.slice(offset, offset + chunkSize))
+      controller.enqueue(bytes.subarray(offset, offset + chunkSize))
       offset += chunkSize
     },
   })
+}
+
+/** Heap in use, with a collection forced first where the runtime allows it. */
+function heapUsed(): number {
+  const gc = (globalThis as { gc?: () => void }).gc
+  if (gc) {
+    gc()
+    gc()
+  }
+  return process.memoryUsage().heapUsed
 }
 
 async function collect<T>(stream: ReadableStream<Uint8Array>, key: string): Promise<T[]> {
@@ -94,24 +111,33 @@ test('a missing key terminates instead of hanging', async () => {
 })
 
 test('memory stays bounded across a large stream', async () => {
-  // 40k elements is ~4 MB of JSON; peak RSS growth should be far below that
-  // if the buffer is really being trimmed as elements are yielded.
+  // ~40 MB of JSON, which a JS engine holds as ~80 MB of UTF-16 string if the
+  // buffer is never trimmed. Asserting well under that proves the trimming is
+  // real, with enough margin that GC timing can't decide the result.
   const big = JSON.stringify({
-    locations: Array.from({ length: 40_000 }, (_, i) => ({
+    locations: Array.from({ length: 400_000 }, (_, i) => ({
       latitudeE7: 400000000 + i,
       longitudeE7: -740000000,
       timestamp: '2020-01-01T00:00:00Z',
     })),
   })
+  // Encode up front: the 40 MB byte array is the harness's cost, not the
+  // parser's, and must not land inside the measurement window.
+  const bytes = new TextEncoder().encode(big)
+  const stream = chunkedBytes(bytes, 16_384)
+
   let count = 0
   let peak = 0
-  const before = process.memoryUsage().heapUsed
-  for await (const _ of streamArrayItems(chunked(big, 16_384), 'locations')) {
+  const before = heapUsed()
+  for await (const _ of streamArrayItems(stream, 'locations')) {
     count++
-    if (count % 5000 === 0) {
-      peak = Math.max(peak, process.memoryUsage().heapUsed - before)
+    if (count % 20_000 === 0) {
+      peak = Math.max(peak, heapUsed() - before)
     }
   }
-  assert.equal(count, 40_000)
-  assert.ok(peak < 12_000_000, `heap growth ${peak} bytes should stay bounded`)
+  assert.equal(count, 400_000)
+  assert.ok(
+    peak < 25_000_000,
+    `heap growth ${(peak / 1e6).toFixed(1)} MB should stay far below the ~80 MB an untrimmed buffer would hold`,
+  )
 })

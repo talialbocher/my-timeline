@@ -97,7 +97,7 @@ try {
   await page.screenshot({ path: join(ARTIFACTS, '02-sources.png'), fullPage: true })
 
   const started = Date.now()
-  await page.locator('input[accept=".json,.zip"]').setInputFiles(FIXTURE)
+  await page.locator('input[accept=".json,.zip,application/json,application/zip"]').setInputFiles(FIXTURE)
   await page.waitForSelector('.status--ok', { timeout: 180_000 })
   const importMsg = (await page.locator('.status--ok').textContent()) ?? ''
   const elapsed = ((Date.now() - started) / 1000).toFixed(1)
@@ -172,6 +172,90 @@ try {
     (await page.locator('.day__headline').textContent()) ?? '',
   )
   await page.screenshot({ path: join(ARTIFACTS, '07-tokyo.png') })
+
+  console.log('\nbackup round trip')
+  await page.locator('.tab', { hasText: 'Sources' }).click()
+  await page.waitForTimeout(300)
+
+  const eventsBefore = await page.evaluate(async () => {
+    const open = indexedDB.open('my-timeline')
+    const database = await new Promise((resolve) => (open.onsuccess = () => resolve(open.result)))
+    return await new Promise((resolve) => {
+      const req = database.transaction('events').objectStore('events').count()
+      req.onsuccess = () => resolve(req.result)
+    })
+  })
+
+  const downloadPromise = page.waitForEvent('download', { timeout: 120_000 })
+  await page.getByRole('button', { name: 'Export', exact: true }).click()
+  const download = await downloadPromise
+  const backupPath = join(ARTIFACTS, 'backup.timeline.zip')
+  await download.saveAs(backupPath)
+  check('a backup file is produced', download.suggestedFilename().endsWith('.timeline.zip'),
+    download.suggestedFilename())
+
+  page.once('dialog', (d) => d.accept())
+  await page.getByRole('button', { name: 'Erase all data' }).click()
+  await page.waitForTimeout(800)
+  const eventsAfterErase = await page.evaluate(async () => {
+    const open = indexedDB.open('my-timeline')
+    const database = await new Promise((resolve) => (open.onsuccess = () => resolve(open.result)))
+    return await new Promise((resolve) => {
+      const req = database.transaction('events').objectStore('events').count()
+      req.onsuccess = () => resolve(req.result)
+    })
+  })
+  check('erasing really empties the store', eventsAfterErase === 0, `${eventsAfterErase} events left`)
+
+  await page.locator('input[accept=".zip,application/zip"]').setInputFiles(backupPath)
+  await page.waitForSelector('.status--ok', { timeout: 120_000 })
+  const restoreMsg = await page.locator('.status--ok').textContent()
+  const eventsAfterRestore = await page.evaluate(async () => {
+    const open = indexedDB.open('my-timeline')
+    const database = await new Promise((resolve) => (open.onsuccess = () => resolve(open.result)))
+    return await new Promise((resolve) => {
+      const req = database.transaction('events').objectStore('events').count()
+      req.onsuccess = () => resolve(req.result)
+    })
+  })
+  check('restoring brings every event back', eventsAfterRestore === eventsBefore,
+    `${eventsBefore} → ${eventsAfterRestore}. ${restoreMsg?.trim()}`)
+
+  await page.locator('.tab').first().click()
+  await page.waitForTimeout(600)
+  check('the restored archive renders', (await page.locator('.day__headline').count()) === 1,
+    (await page.locator('.topbar__day').textContent()) ?? '')
+
+  console.log('\ninstalled-app behaviour')
+  // iOS marks an installed Home Screen app with navigator.standalone. In that
+  // mode the OAuth sources must refuse rather than open a popup that can never
+  // report back.
+  const installed = await browser.newContext({ ...devices['iPhone 14 Pro'] })
+  await installed.addInitScript(() => {
+    Object.defineProperty(navigator, 'standalone', { value: true, configurable: true })
+  })
+  const installedPage = await installed.newPage()
+  await installedPage.goto(BASE, { waitUntil: 'networkidle' })
+  await installedPage.locator('.tab', { hasText: 'Sources' }).click()
+  await installedPage.waitForTimeout(400)
+
+  check(
+    'OAuth sources are refused in the installed app',
+    await installedPage.getByRole('button', { name: 'Connect' }).isDisabled(),
+  )
+  check(
+    'and it explains why, with what to do instead',
+    (await installedPage.getByText('Not available in the installed app').count()) === 2,
+  )
+  check(
+    'while the file-import sources stay usable',
+    (await installedPage.locator('input[accept=".json,.zip,application/json,application/zip"]').count()) === 1,
+  )
+  await installedPage.screenshot({
+    path: join(ARTIFACTS, '09-installed-sources.png'),
+    fullPage: true,
+  })
+  await installed.close()
 
   console.log('\nappearance')
   await page.locator('.tab', { hasText: 'Sources' }).click()

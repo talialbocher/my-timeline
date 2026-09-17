@@ -10,11 +10,16 @@
  *
  * Thumbnails are downloaded and stored locally because picker base URLs expire
  * about an hour after the session.
+ *
+ * The picker opens outside the app, which on iOS means the app is backgrounded
+ * and may be discarded before you finish choosing. The session is therefore
+ * persisted, so an interrupted import can be picked up where it left off
+ * rather than starting over.
  */
 import { googleFetch, getAccessToken } from './google-auth'
 import type { PhotoEvent } from '../lib/model'
 import { dayKey } from '../lib/time'
-import { putBlob, putEvents } from '../lib/db'
+import { getMeta, putBlob, putEvents, setMeta } from '../lib/db'
 
 const API = 'https://photospicker.googleapis.com/v1'
 
@@ -57,6 +62,17 @@ export interface PickerOptions {
   onPickerUri?: (uri: string) => void
 }
 
+const PENDING_KEY = 'photos-picker.session'
+
+/** A picker session left open by an import that was interrupted. */
+export async function getPendingPickerSession(): Promise<PickingSession | null> {
+  return await getMeta<PickingSession | null>(PENDING_KEY, null)
+}
+
+export async function clearPendingPickerSession(): Promise<void> {
+  await setMeta(PENDING_KEY, null)
+}
+
 export async function importFromPhotosPicker(opts: PickerOptions = {}): Promise<number> {
   const { signal, onProgress, onPickerUri } = opts
   onProgress?.({ phase: 'opening', fetched: 0, total: 0, label: 'Opening Google Photos' })
@@ -68,6 +84,9 @@ export async function importFromPhotosPicker(opts: PickerOptions = {}): Promise<
     signal,
   })
   const session = (await createRes.json()) as PickingSession
+  // Recorded before the picker steals focus, so the import survives the app
+  // being backgrounded or discarded while you choose.
+  await setMeta(PENDING_KEY, session)
 
   onPickerUri?.(session.pickerUri)
   // Opened from the click handler upstream where possible; this is the fallback.
@@ -81,6 +100,22 @@ export async function importFromPhotosPicker(opts: PickerOptions = {}): Promise<
     })
   }
 
+  return await collectPickedItems(session, opts)
+}
+
+/** Continue an import whose picker session is still open. */
+export async function resumePhotosPickerImport(opts: PickerOptions = {}): Promise<number> {
+  const session = await getPendingPickerSession()
+  if (!session) return 0
+  opts.onPickerUri?.(session.pickerUri)
+  return await collectPickedItems(session, opts)
+}
+
+async function collectPickedItems(
+  session: PickingSession,
+  opts: PickerOptions,
+): Promise<number> {
+  const { signal, onProgress } = opts
   const ready = await pollUntilPicked(session, { signal, onProgress })
   if (!ready) {
     onProgress?.({ phase: 'done', fetched: 0, total: 0, label: 'Picker timed out' })
@@ -113,6 +148,7 @@ export async function importFromPhotosPicker(opts: PickerOptions = {}): Promise<
   await putEvents(events)
   // The session holds a reference to your selection; drop it once imported.
   await deleteSession(session.id).catch(() => undefined)
+  await clearPendingPickerSession()
 
   onProgress?.({
     phase: 'done',

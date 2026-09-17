@@ -5,14 +5,26 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { syncGmail } from '../sources/gmail'
-import { importFromPhotosPicker } from '../sources/photos-picker'
+import {
+  clearPendingPickerSession,
+  getPendingPickerSession,
+  importFromPhotosPicker,
+  resumePhotosPickerImport,
+} from '../sources/photos-picker'
 import { importLocationFiles } from '../sources/timeline-import'
 import { importPhotoFiles } from '../sources/exif-import'
 import { getClientId, hasToken, setClientId, signOut } from '../sources/google-auth'
 import { clearAll, clearSource, stats, type StoreStats } from '../lib/db'
+import { backupFilename, downloadBlob, exportBackup, importBackup } from '../lib/backup'
 import { SOURCE_LABELS, type SourceId } from '../lib/model'
 import { todayKey } from '../lib/time'
 import { getThemePref, setThemePref, type ThemePref } from '../lib/theme'
+import {
+  canHostOAuthPopup,
+  isStandalone,
+  isStoragePersisted,
+  requestPersistentStorage,
+} from '../lib/platform'
 
 interface Job {
   card: string
@@ -34,6 +46,11 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
   const [clientId, setClientIdState] = useState(getClientId())
   const [pickerUri, setPickerUri] = useState<string | null>(null)
   const [theme, setTheme] = useState<ThemePref>(getThemePref)
+  const [persisted, setPersisted] = useState(false)
+  const [resumable, setResumable] = useState(false)
+  // Computed once: neither can change without a reload.
+  const [oauthUsable] = useState(canHostOAuthPopup)
+  const [standalone] = useState(isStandalone)
   const abortRef = useRef<AbortController | null>(null)
 
   const refreshStats = useCallback(() => {
@@ -41,6 +58,11 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
   }, [])
 
   useEffect(refreshStats, [refreshStats])
+
+  useEffect(() => {
+    isStoragePersisted().then(setPersisted)
+    getPendingPickerSession().then((session) => setResumable(Boolean(session)))
+  }, [job])
 
   const run = useCallback(
     async (card: string, fn: (signal: AbortSignal) => Promise<void>) => {
@@ -50,6 +72,9 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
       setDone(null)
       setJob({ card, label: 'Starting…' })
       try {
+        // Asked during a deliberate action, which is when WebKit is most
+        // likely to grant it. Failure is not fatal, just less durable.
+        await requestPersistentStorage()
         await fn(controller.signal)
         onChanged()
         refreshStats()
@@ -78,7 +103,7 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
           <span className="card__title">Gmail</span>
           <button
             className="btn btn--primary"
-            disabled={busy}
+            disabled={busy || !oauthUsable}
             onClick={() =>
               run('gmail', async (signal) => {
                 const added = await syncGmail({
@@ -108,6 +133,7 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
         <p className="card__note">
           Capped at 5,000 messages per sync, newest first, from 2015 onward.
         </p>
+        {!oauthUsable && <OAuthUnavailable />}
         {job?.card === 'gmail' && <Progress job={job} onCancel={() => abortRef.current?.abort()} />}
       </div>
 
@@ -117,7 +143,7 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
           <span className="card__title">Google Photos</span>
           <button
             className="btn btn--primary"
-            disabled={busy}
+            disabled={busy || !oauthUsable}
             onClick={() =>
               run('photos', async (signal) => {
                 const added = await importFromPhotosPicker({
@@ -147,6 +173,42 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
           the only route left, and it strips GPS from everything it returns. So
           photos here contribute <em>when</em>, not <em>where</em>.
         </p>
+        {!oauthUsable && <OAuthUnavailable />}
+        {resumable && oauthUsable && (
+          <div className="btnrow">
+            <button
+              className="btn"
+              disabled={busy}
+              onClick={() =>
+                run('photos', async (signal) => {
+                  const added = await resumePhotosPickerImport({
+                    signal,
+                    onPickerUri: setPickerUri,
+                    onProgress: (p) =>
+                      setJob({
+                        card: 'photos',
+                        label: p.label,
+                        fraction: p.total ? p.fetched / p.total : undefined,
+                      }),
+                  })
+                  setDone(`Added ${added.toLocaleString()} photos.`)
+                })
+              }
+            >
+              Resume interrupted import
+            </button>
+            <button
+              className="btn"
+              disabled={busy}
+              onClick={async () => {
+                await clearPendingPickerSession()
+                setResumable(false)
+              }}
+            >
+              Discard it
+            </button>
+          </div>
+        )}
         {pickerUri && (
           <p className="card__note">
             <a href={pickerUri} target="_blank" rel="noreferrer">
@@ -175,7 +237,7 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
         </p>
         <DropZone
           disabled={busy}
-          accept=".json,.zip"
+          accept=".json,.zip,application/json,application/zip"
           hint="Drop a Timeline export or Takeout .zip"
           onFiles={(files) =>
             run('timeline', async (signal) => {
@@ -231,6 +293,59 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
           }
         />
         {job?.card === 'exif' && <Progress job={job} onCancel={() => abortRef.current?.abort()} />}
+      </div>
+
+      {/* ---------- Backup ---------- */}
+      <div className="card">
+        <div className="card__head">
+          <span className="card__title">Backup</span>
+          <button
+            className="btn"
+            disabled={busy || (store?.events ?? 0) === 0}
+            onClick={() =>
+              run('backup', async () => {
+                const blob = await exportBackup({
+                  onProgress: (p) =>
+                    setJob({ card: 'backup', label: p.label, fraction: p.fraction }),
+                })
+                downloadBlob(blob, backupFilename())
+                setDone('Backup saved.')
+              })
+            }
+          >
+            Export
+          </button>
+        </div>
+        <p className="card__desc">
+          Everything in one file — events and thumbnails. With no server to sync
+          through, this is how the timeline moves between your computer and your
+          phone.
+        </p>
+        <p className="card__note">
+          Restoring merges rather than replaces, so importing the same backup
+          twice is harmless. The file is not encrypted; treat it like the photos
+          it came from.
+        </p>
+        <DropZone
+          disabled={busy}
+          accept=".zip,application/zip"
+          multiple={false}
+          hint="Drop a backup to restore"
+          onFiles={(files) =>
+            run('backup', async () => {
+              const result = await importBackup(files[0], {
+                onProgress: (p) =>
+                  setJob({ card: 'backup', label: p.label, fraction: p.fraction }),
+              })
+              setDone(
+                `Restored ${result.events.toLocaleString()} events and ${result.thumbnails.toLocaleString()} thumbnails.`,
+              )
+            })
+          }
+        />
+        {job?.card === 'backup' && (
+          <Progress job={job} onCancel={() => abortRef.current?.abort()} />
+        )}
       </div>
 
       {/* ---------- Settings ---------- */}
@@ -313,6 +428,16 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
                     </td>
                   </tr>
                 )}
+                <tr>
+                  <th>Eviction</th>
+                  <td>
+                    {persisted
+                      ? 'Protected'
+                      : standalone
+                        ? 'Not protected yet — import something'
+                        : 'Install to the Home Screen to protect'}
+                  </td>
+                </tr>
               </tbody>
             </table>
 
@@ -353,6 +478,23 @@ export function Sources({ onChanged, showTiles, onShowTilesChange }: Props) {
         )}
       </div>
     </div>
+  )
+}
+
+/**
+ * Installed iOS apps cannot host the consent popup Google's library opens, and
+ * Google requires a client secret for the redirect alternative — which an app
+ * with no server has nowhere to keep. So this says what to do instead.
+ */
+function OAuthUnavailable() {
+  return (
+    <p className="card__note">
+      <strong>Not available in the installed app.</strong> iOS home-screen apps
+      can't host the Google consent window, and their storage is separate from
+      Safari's, so signing in there wouldn't reach this app either. Import this
+      source on a computer, export a backup from there, and restore it here —
+      the Backup card below does both halves.
+    </p>
   )
 }
 

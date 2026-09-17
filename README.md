@@ -83,14 +83,25 @@ npm run test:e2e   # drives the built app in Chromium at iPhone viewport
 
 ### Getting it onto the iPhone
 
-Safari will only install a PWA served over HTTPS, so `dist/` needs a host —
-any static host will do (Vercel, Netlify, GitHub Pages, Cloudflare Pages).
-Then on the phone: open the URL in **Safari → Share → Add to Home Screen**.
+See **[docs/IPHONE.md](docs/IPHONE.md)** — it covers hosting, storage
+persistence, and the one real constraint: **Gmail and Photos cannot sign in
+from an installed iOS app**, because it can't host Google's consent popup, the
+redirect alternative needs a client secret this app has nowhere to keep, and an
+installed app's storage is isolated from Safari's.
 
-Hosting the static files does not put your data anywhere: the host serves HTML,
-CSS and JavaScript, and every byte of your timeline is produced and stored on
-the phone. Add the deployed origin to your OAuth client's authorized JavaScript
-origins (see the setup doc) if you want Gmail and Photos to work there too.
+The short version: deploy (configs for GitHub Pages, Vercel and Netlify are in
+the repo), **Safari → Share → Add to Home Screen**, import location and photo
+files directly on the phone, and for Gmail and Photos ingest on a computer and
+carry the result over with **Sources → Backup**.
+
+## Moving the archive between devices
+
+**Sources → Backup → Export** writes one `.timeline.zip` with every event and
+thumbnail; dropping it back in restores them. With no server to sync through,
+this is how the timeline gets from a computer to the phone — and since Gmail
+and Photos can only be connected from a desktop browser, it is how their data
+gets there at all. Restoring merges on event id, so re-importing the same
+backup is harmless. The file is not encrypted.
 
 ## Privacy, concretely
 

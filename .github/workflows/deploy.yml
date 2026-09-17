@@ -1,0 +1,48 @@
+# Publishes the app to GitHub Pages, which is the shortest path to the HTTPS
+# origin an iPhone needs before Safari will install it to the Home Screen.
+#
+# Enable once, in Settings → Pages → Source → GitHub Actions. The site lands at
+# https://<user>.github.io/<repo>/ — hence BASE_PATH.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Build
+        # Serving from a repository subpath, so the app is told where it lives.
+        run: BASE_PATH="/${GITHUB_REPOSITORY#*/}/" npm run build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
